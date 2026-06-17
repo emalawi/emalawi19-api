@@ -1,0 +1,239 @@
+// emalawi19-api Worker
+// Handles: /register, /login, /logout, /me
+
+const PBKDF2_ITERATIONS = 100000; // Workers' enforced max for crypto.subtle PBKDF2
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+async function hashPassword(password, saltBytes) {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: PBKDF2_ITERATIONS,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    256 // 256-bit output
+  );
+  return bytesToHex(new Uint8Array(derivedBits));
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+async function handleRegister(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const { email, password, display_name } = body;
+
+  if (!email || !isValidEmail(email)) {
+    return jsonResponse({ error: "Valid email is required" }, 400);
+  }
+  if (!password || password.length < 8) {
+    return jsonResponse({ error: "Password must be at least 8 characters" }, 400);
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?")
+    .bind(normalizedEmail)
+    .first();
+
+  if (existing) {
+    return jsonResponse({ error: "An account with this email already exists" }, 409);
+  }
+
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const saltHex = bytesToHex(saltBytes);
+  const passwordHash = await hashPassword(password, saltBytes);
+
+  const result = await env.DB.prepare(
+    `INSERT INTO users (email, password_hash, salt, display_name)
+     VALUES (?, ?, ?, ?)`
+  )
+    .bind(normalizedEmail, passwordHash, saltHex, display_name || null)
+    .run();
+
+  return jsonResponse({
+    success: true,
+    user_id: result.meta.last_row_id,
+    email: normalizedEmail,
+  }, 201);
+}
+
+async function handleLogin(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const { email, password } = body;
+
+  if (!email || !password) {
+    return jsonResponse({ error: "Email and password are required" }, 400);
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const user = await env.DB.prepare(
+    "SELECT id, email, password_hash, salt FROM users WHERE email = ?"
+  )
+    .bind(normalizedEmail)
+    .first();
+
+  // Always compute a hash even if user not found, to reduce timing-based
+  // email enumeration. Use a fixed dummy salt in that case.
+  const saltHex = user ? user.salt : "00000000000000000000000000000000";
+  const saltBytes = hexToBytes(saltHex);
+  const computedHash = await hashPassword(password, saltBytes);
+
+  if (!user || computedHash !== user.password_hash) {
+    return jsonResponse({ error: "Invalid email or password" }, 401);
+  }
+
+  const sessionId = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
+
+  await env.DB.prepare(
+    "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"
+  )
+    .bind(sessionId, user.id, expiresAt)
+    .run();
+
+  const headers = new Headers({ "Content-Type": "application/json" });
+  headers.append(
+    "Set-Cookie",
+    `session_id=${sessionId}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_DURATION_MS / 1000}`
+  );
+
+  return new Response(
+    JSON.stringify({ success: true, user_id: user.id, email: user.email }),
+    { status: 200, headers }
+  );
+}
+
+function getCookie(request, name) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(new RegExp(`${name}=([^;]+)`));
+  return match ? match[1] : null;
+}
+
+async function getSessionUser(request, env) {
+  const sessionId = getCookie(request, "session_id");
+  if (!sessionId) return null;
+
+  const session = await env.DB.prepare(
+    `SELECT s.user_id, s.expires_at, u.id, u.email, u.display_name, u.email_verified
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.id = ?`
+  )
+    .bind(sessionId)
+    .first();
+
+  if (!session) return null;
+  if (new Date(session.expires_at) < new Date()) {
+    await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
+    return null;
+  }
+  return session;
+}
+
+async function handleMe(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) {
+    return jsonResponse({ error: "Not authenticated" }, 401);
+  }
+  return jsonResponse({
+    id: user.id,
+    email: user.email,
+    display_name: user.display_name,
+    email_verified: !!user.email_verified,
+  });
+}
+
+async function handleLogout(request, env) {
+  const sessionId = getCookie(request, "session_id");
+  if (sessionId) {
+    await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
+  }
+  const headers = new Headers({ "Content-Type": "application/json" });
+  headers.append(
+    "Set-Cookie",
+    "session_id=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"
+  );
+  return new Response(JSON.stringify({ success: true }), { status: 200, headers });
+}
+
+function withCors(response, origin) {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin || "*");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type");
+  headers.set("Access-Control-Allow-Credentials", "true");
+  return new Response(response.body, { status: response.status, headers });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const origin = request.headers.get("Origin");
+
+    if (request.method === "OPTIONS") {
+      return withCors(new Response(null, { status: 204 }), origin);
+    }
+
+    let response;
+    try {
+      if (url.pathname === "/register" && request.method === "POST") {
+        response = await handleRegister(request, env);
+      } else if (url.pathname === "/login" && request.method === "POST") {
+        response = await handleLogin(request, env);
+      } else if (url.pathname === "/logout" && request.method === "POST") {
+        response = await handleLogout(request, env);
+      } else if (url.pathname === "/me" && request.method === "GET") {
+        response = await handleMe(request, env);
+      } else {
+        response = jsonResponse({ error: "Not found" }, 404);
+      }
+    } catch (err) {
+      response = jsonResponse({ error: "Internal server error", detail: String(err) }, 500);
+    }
+
+    return withCors(response, origin);
+  },
+};
